@@ -1,17 +1,3 @@
-"""Naive Bayes multinomial implementado desde cero.
-
-Reglas:
-- Los cálculos se hacen solo con NumPy. No se puede importar scipy ni usar sklearn.naive_bayes.
-- La clase hereda de ClassifierMixin y BaseEstimator solo para poder usarse dentro de un
-  Pipeline y de GridSearchCV de scikit-learn (eso le da get_params, set_params y score).
-- Todo se calcula en escala logarítmica: multiplicar cientos de probabilidades chicas da 0
-  en punto flotante (underflow).
-- X puede ser un array de NumPy o una matriz dispersa de SciPy (la que devuelve CountVectorizer).
-  Las operaciones X[filas], X.sum(axis=0) y X @ M funcionan con ambas; usá np.asarray(...) para
-  convertir los resultados a arrays comunes.
-
-Verificá tu trabajo con:  python -m pytest -q tests/test_naive_bayes.py
-"""
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 
@@ -23,7 +9,8 @@ def log_suma_exp(a, axis=1):
 
     Ejemplo: log_suma_exp(np.array([[-1000.0, -1000.0]])) -> array([-999.3069...])
     """
-    raise NotImplementedError("Completar log_suma_exp")
+    m = np.max(a, axis=axis, keepdims=True)
+    return (m + np.log(np.sum(np.exp(a - m), axis=axis, keepdims=True))).squeeze(axis=axis)
 
 
 class NaiveBayesMultinomial(ClassifierMixin, BaseEstimator):
@@ -53,26 +40,60 @@ class NaiveBayesMultinomial(ClassifierMixin, BaseEstimator):
 
     def fit(self, X, y):
         """Estima las probabilidades a partir de la matriz de conteos X y las etiquetas y. Devuelve self."""
-        raise NotImplementedError("Completar fit")
+        # Convertir a array de numpy o mantener compatibilidad con matrices dispersas
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+        
+        # Cantidad de documentos por clase
+        self.class_count_ = np.array([np.sum(y == c) for c in self.classes_])
+        
+        # Probabilidad a priori en escala logarítmica: log P(c)
+        n_docs = len(y)
+        self.class_log_prior_ = np.log(self.class_count_ / n_docs)
+        
+        # Suma de conteos de términos por clase (feature_count_)
+        # X soporta X[filas] y X.sum(axis=0) tanto para arrays como matrices dispersas
+        self.feature_count_ = np.array([
+            np.asarray(X[y == c].sum(axis=0)).flatten() 
+            for c in self.classes_
+        ])
+        
+        # Suavizado aditivo (Laplace si alpha=1) y cálculo de log P(t | c)
+        smoothed_counts = self.feature_count_ + self.alpha
+        smoothed_totals = smoothed_counts.sum(axis=1, keepdims=True)
+        self.feature_log_prob_ = np.log(smoothed_counts) - np.log(smoothed_totals)
+        
+        return self
 
     def _log_verosimilitud_conjunta(self, X):
-        """Devuelve log P(c) + sum_t x_t · log P(t | c) para cada documento y clase.
-
-        Forma del resultado: (n_documentos, n_clases). Se resuelve con un solo producto matricial.
-        """
-        raise NotImplementedError("Completar _log_verosimilitud_conjunta")
+        """Devuelve log P(c) + sum_t x_t · log P(t | c) para cada documento y clase."""
+        # Convertir a matriz densa si es dispersa de SciPy
+        if hasattr(X, "toarray"):
+            X_arr = X.toarray()
+        else:
+            X_arr = np.asarray(X)
+            
+        # Si la entrada es un vector unidimensional (1 sola muestra), convertirlo a 2D (1, n_features)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+            
+        return X_arr @ self.feature_log_prob_.T + self.class_log_prior_
 
     def predict_log_proba(self, X):
         """log P(c | documento): la log-verosimilitud conjunta normalizada con log_suma_exp."""
-        raise NotImplementedError("Completar predict_log_proba")
+        jll = self._log_verosimilitud_conjunta(X)
+        log_prob_x = log_suma_exp(jll, axis=1)
+        return jll - log_prob_x[:, np.newaxis]
 
     def predict_proba(self, X):
         """P(c | documento). Cada fila suma 1. Las columnas siguen el orden de classes_."""
-        raise NotImplementedError("Completar predict_proba")
+        return np.exp(self.predict_log_proba(X))
 
     def predict(self, X):
         """La clase con mayor probabilidad a posteriori para cada documento."""
-        raise NotImplementedError("Completar predict")
+        jll = self._log_verosimilitud_conjunta(X)
+        return self.classes_[np.argmax(jll, axis=1)]
 
 
 def terminos_mas_indicativos(modelo, vocabulario, n=10):
@@ -85,4 +106,20 @@ def terminos_mas_indicativos(modelo, vocabulario, n=10):
     `vocabulario` es la lista de términos en el orden de las columnas de X
     (por ejemplo, CountVectorizer.get_feature_names_out()).
     """
-    raise NotImplementedError("Completar terminos_mas_indicativos")
+    resultado = {}
+    vocabulario = np.asarray(vocabulario)
+    n_clases = len(modelo.classes_)
+    
+    for i, clase in enumerate(modelo.classes_):
+        # Promedio de log P(t | c') en las demás clases c'
+        out_classes = [j for j in range(n_clases) if j != i]
+        promedio_otras = modelo.feature_log_prob_[out_classes].mean(axis=0)
+        
+        # Puntaje del término para la clase c
+        puntajes = modelo.feature_log_prob_[i] - promedio_otras
+        
+        # Obtener los n índices de mayor puntaje
+        top_indices = np.argsort(puntajes)[::-1][:n]
+        resultado[clase] = vocabulario[top_indices].tolist()
+        
+    return resultado
